@@ -6,6 +6,16 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "muth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muthgen"
+path = "src/main.rs"
+
 [dependencies]
 cpal = "0.11.0"
-rand = "0.7.3"
+rand = { version = "0.7.3", features = ["small_rng"] }
+crossterm = "0.17"
+tui = { version = "0.9", default-features = false, features = ['crossterm'] }

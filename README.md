@@ -65,3 +65,21 @@
 - rhythmic fragment
 - melodic shape
 - melodic fragment
+
+
+# Inspiration
+
+- https://en.wikipedia.org/wiki/Modulation_(music)#Common-tone_modulation
+- https://en.wikipedia.org/wiki/Atonality
+- https://en.wikipedia.org/wiki/Twelve-tone_technique
+- https://en.wikipedia.org/wiki/Serialism
+- https://en.wikipedia.org/wiki/Peter_Westergaard%27s_tonal_theory
+- https://en.wikipedia.org/wiki/Unified_field
+- https://en.wikipedia.org/wiki/Counterpoint
+- https://en.wikipedia.org/wiki/Polyphony
+- https://en.wikipedia.org/wiki/Pitch_space
+- https://en.wikipedia.org/wiki/Emancipation_of_the_dissonance
+- https://en.wikipedia.org/wiki/Diatonic_set_theory
+- https://en.wikipedia.org/wiki/Common_tone_(scale)
+- https://en.wikipedia.org/wiki/Spiral_array_model
+- https://en.wikipedia.org/wiki/Music_and_mathematics

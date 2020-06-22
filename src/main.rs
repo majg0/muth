@@ -1,6 +1,42 @@
-use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
-use cpal::{StreamData, UnknownTypeOutputBuffer};
-use rand::prelude::*;
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// imports
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+use std::{
+    error::Error,
+    io::{stdout, Write},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use tui::{
+    backend::CrosstermBackend,
+    //layout::{Constraint, Direction, Layout},
+    widgets::{Block, Borders /*, Widget*/},
+    Terminal,
+};
+
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
+use cpal::{
+    traits::{DeviceTrait, EventLoopTrait, HostTrait},
+    StreamData, UnknownTypeOutputBuffer,
+};
+
+use rand::{prelude::*, rngs::SmallRng};
+
+use muth::*;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// constants
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 pub const TAU: f64 = 2. * std::f64::consts::PI;
 
@@ -8,7 +44,7 @@ pub const TAU: f64 = 2. * std::f64::consts::PI;
 // utility fns
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-pub fn pitch(n: u8) -> f64 {
+pub fn pitch(n: Note) -> f64 {
     2f64.powf(((n as f64) - 69.) / 12.) * 440.
 }
 
@@ -26,92 +62,23 @@ pub fn clamp(a: f64, b: f64, x: f64) -> f64 {
 
 #[derive(Debug, Default)]
 pub struct Phrase {
-    pub data: Vec<u8>,
-    pub len: Vec<u8>,
-}
-
-#[derive(Debug, Default)]
-pub struct PhraseContext {
-    pub notes: Vec<u8>, // 0 = rest
-    pub sub_pow: u8,    // subdivide
-}
-
-#[derive(Debug, Default)]
-pub struct PhraseIterator {
-    pub ix: usize,
-}
-impl PhraseIterator {
-    pub fn next(&mut self, data: &Vec<u8>, len: &Vec<u8>) -> Option<PhraseNote> {
-        let ix = self.ix;
-        if ix < data.len() {
-            self.ix = ix + 1;
-            return Some(PhraseNote {
-                ix: data[ix] as usize,
-                len: len[ix] as f64,
-            });
-        }
-        None
-    }
-}
-
-#[derive(Debug)]
-pub struct PhraseNote {
-    pub ix: usize,
-    pub len: f64,
+    pub degrees: Vec<Degree>,
+    pub durations: Vec<BeatTime>,
 }
 
 #[derive(Debug, Default)]
 pub struct VoiceController {
     pub voice_ix: usize,
-    pub age: f64,
-    pub lifetime: f64,
-    pub midi_note: u8,
-}
-impl VoiceController {
-    pub fn step_time(&mut self, life_step: f64) {
-        self.age += life_step;
-        self.lifetime -= life_step;
-    }
+    pub start_beat: BeatTime,
+    pub end_beat: BeatTime,
+    pub midi_note: Option<Note>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Voice {
     pub phase: f64,
     pub freq: f64,
     pub amp: f64,
-}
-impl Voice {
-    pub fn new() -> Voice {
-        Voice {
-            phase: 0.,
-            freq: 0.,
-            amp: 0.,
-        }
-    }
-
-    pub fn step_time(
-        &mut self,
-        note_freq: f64,
-        age: f64,
-        lifetime: f64,
-        t_rel: f64,
-        dt_rel: f64,
-        vib_hz: f64,
-        vib_amp: f64,
-        fade_in_t: f64,
-        fade_out_t: f64,
-        wavetable: &[f64; WAVETABLE_SIZE],
-    ) {
-        self.freq = note_freq + vib_amp * (t_rel * TAU * vib_hz).sin();
-        self.phase = (self.phase + dt_rel * self.freq) % 1.;
-        self.amp = f64::min(
-            f64::min(
-                lerp(0., 1., age / fade_in_t),
-                lerp(0., 1., lifetime / fade_out_t),
-            ),
-            1.,
-        ) * wavetable_lerp_sample(&wavetable, self.phase);
-    }
 }
 
 pub struct SynthSettings {
@@ -132,24 +99,22 @@ pub struct Timing {
     pub dt_abs: f64, // = inv sample freq
     pub t_abs: f64,
     pub bpm: f64,
-    pub life_step: f64,
-    pub measures: f64,
+    pub beat: f64,
 }
 impl Timing {
     pub fn new(sample_rate: f64, bpm: f64) -> Timing {
         let dt = 1. / sample_rate;
-        let life_step = (dt * bpm) as f64 / 4. / 60.;
+        let time_speed = 1.0;
         Timing {
             sample_rate,
             sample_num: 0,
-            time_speed: 1.,
-            dt_rel: dt,
+            time_speed,
+            dt_rel: dt * time_speed,
             t_rel: 0.,
             dt_abs: dt,
             t_abs: 0.,
             bpm,
-            life_step,
-            measures: 0.,
+            beat: 0.,
         }
     }
 
@@ -157,15 +122,14 @@ impl Timing {
         self.sample_num = self.sample_num + 1;
         self.t_abs = self.sample_num as f64 * self.dt_abs;
         self.t_rel += self.dt_rel;
-        self.measures += self.life_step;
+        self.beat += (DURATION_MULTIPLIER as f64 * self.dt_rel * self.bpm) / 60.;
     }
 }
 
 #[derive(Debug, Default)]
 pub struct MelodyLine {
     phrase: Phrase,
-    iter: PhraseIterator,
-    beat_countdown: f64,
+    note_ix: usize,
     voice_controller: VoiceController,
 }
 
@@ -203,7 +167,12 @@ pub fn wavetable_lerp_sample(wavetable: &[f64; WAVETABLE_SIZE], t: f64) -> f64 {
     )
 }
 
-fn main() {
+enum InputEvent {
+    Key(KeyEvent),
+    Tick,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
     let host = cpal::default_host();
     let event_loop = host.event_loop();
 
@@ -239,147 +208,291 @@ fn main() {
     };
     let mut synth_0_voices = Vec::new();
 
-    synth_0_voices.push(Voice::new());
-
-    let phrase_context = PhraseContext {
-        notes: vec![60, 62, 64, 67, 69],
-        sub_pow: 2,
-    };
-
     let mut melody_lines = Vec::new();
     for _ in 0..4 {
         let mut m = MelodyLine::default();
         m.voice_controller.voice_ix = synth_0_voices.len();
         melody_lines.push(m);
-        synth_0_voices.push(Voice::new());
+        synth_0_voices.push(Voice::default());
     }
 
-    let gen_phrase = || {
-        let mut rng = rand::thread_rng();
-        let mut data = Vec::new();
-        let mut len = Vec::new();
+    let mut chords_data = Vec::new();
+    let mut chords_len = Vec::new();
+    let mut chord_end_beat = 0;
+    let mut chord_ix = 0;
 
-        let tonic = rng.gen_range(0, 5);
+    //let mut rng = SmallRng::seed_from_u64(1337);
+    let mut rng = SmallRng::from_entropy();
 
-        match rng.gen_range(0, 4) {
-            0 | 1 => {
-                data.push(tonic);
-                len.push(2);
-                data.push((tonic + 2) % 5);
-                len.push(1);
-                data.push((tonic + 4) % 5);
-                len.push(1);
+    let major_family = major_family();
+
+    let gen_chords = |rng: &mut SmallRng| -> (Vec<(Pc, Pc)>, Vec<BeatTime>) {
+        let first = rng.gen_range(0, 7);
+        let borrow_mode = rng.gen_range(1, 7);
+        let borrow_ix = rng.gen_range(1, 3);
+        (
+            vec![
+                (0, first),
+                (
+                    if borrow_ix == 1 { borrow_mode } else { 0 },
+                    (first + 5) % 7,
+                ),
+                (
+                    if borrow_ix == 2 { borrow_mode } else { 0 },
+                    (first + 10) % 7,
+                ),
+                (0, (first + 15) % 7),
+            ],
+            vec![WN, WN, WN, WN],
+        )
+    };
+
+    let gen_phrase = |rng: &mut SmallRng| {
+        let mut degrees = Vec::new();
+        let mut durations = Vec::new();
+
+        match rng.gen_range(0, 3) {
+            0 => {
+                degrees.push(0);
+                durations.push(QN);
+                degrees.push(2);
+                durations.push(QN);
+                degrees.push(4);
+                durations.push(QN);
+                degrees.push(2);
+                durations.push(QN);
             }
-            2 => {
-                data.push(tonic);
-                len.push(4);
+            1 => {
+                degrees.push(0);
+                durations.push(DEN);
+                degrees.push(1);
+                durations.push(SN);
+                degrees.push(2);
+                durations.push(DEN);
+                degrees.push(3);
+                durations.push(SN);
+                degrees.push(4);
+                durations.push(EN);
+                degrees.push(5);
+                durations.push(EN);
+                degrees.push(6);
+                durations.push(EN);
+                degrees.push(4);
+                durations.push(EN);
             }
             _ => {
-                data.push(tonic);
-                len.push(3);
-                data.push((tonic + 1) % 5);
-                len.push(1);
+                degrees.push(0);
+                durations.push(WN);
             }
         }
 
-        Phrase { data, len }
+        Phrase { degrees, durations }
     };
 
-    let mut next_value = || -> f64 {
+    let mut next_value = move || -> f64 {
+        // progress chords
+        if timing.beat as u64 >= chord_end_beat {
+            chord_ix += 1;
+            if chord_ix >= chords_data.len() {
+                chord_ix = 0;
+                let chords = gen_chords(&mut rng);
+                chords_data = chords.0;
+                chords_len = chords.1;
+                // for &(mode, degree) in chords_data.iter() {
+                //     print!(
+                //         "{} ",
+                //         major_family.roman_chord_name(mode as usize, degree as usize)
+                //     );
+                // }
+                // println!();
+            }
+            chord_end_beat += chords_len[chord_ix];
+        }
+
         // progress melodies
         for m in melody_lines.iter_mut() {
-            if m.beat_countdown <= 0.0 {
-                if let Some(PhraseNote { ix, len }) = m.iter.next(&m.phrase.data, &m.phrase.len) {
-                    m.voice_controller = VoiceController {
-                        age: 0.,
-                        lifetime: len / 2f64.powf(phrase_context.sub_pow as f64),
-                        midi_note: phrase_context.notes[ix],
-                        voice_ix: m.voice_controller.voice_ix,
-                    };
-                } else {
-                    m.iter = PhraseIterator::default();
-                    m.phrase = gen_phrase();
-                    assert_ne!(m.phrase.data.len(), 0);
-                    if let Some(PhraseNote { ix, len }) = m.iter.next(&m.phrase.data, &m.phrase.len)
-                    {
-                        m.voice_controller = VoiceController {
-                            age: 0.,
-                            lifetime: len / 2f64.powf(phrase_context.sub_pow as f64),
-                            midi_note: phrase_context.notes[ix],
-                            voice_ix: m.voice_controller.voice_ix,
-                        };
-                    }
+            if timing.beat as u64 >= m.voice_controller.end_beat {
+                m.note_ix = m.note_ix + 1;
+                if m.note_ix >= m.phrase.degrees.len() {
+                    m.note_ix = 0;
+                    m.phrase = gen_phrase(&mut rng);
+                    assert_ne!(m.phrase.degrees.len(), 0);
                 }
-                m.beat_countdown = m.voice_controller.lifetime;
+                let ix = m.phrase.degrees[m.note_ix] as usize;
+                let duration = m.phrase.durations[m.note_ix];
+                assert!(ix < DIATONIC_COUNT);
+                m.voice_controller = VoiceController {
+                    // start_beat: m.voice_controller.end_beat,
+                    // end_beat: m.voice_controller.end_beat
+                    start_beat: timing.beat as u64,
+                    end_beat: timing.beat as u64 + duration, // TODO subdivision working correctly
+                    midi_note: if ix == 255 {
+                        None
+                    } else {
+                        let chord = chords_data[chord_ix];
+                        Some(
+                            major_family.modes[(chord.0 + chord.1) as usize % DIATONIC_COUNT][ix]
+                                + C4
+                                + major_family.modes[chord.0 as usize][chord.1 as usize],
+                        )
+                    },
+                    voice_ix: m.voice_controller.voice_ix,
+                };
+            }
+        }
+
+        // update voices
+        for m in melody_lines.iter_mut() {
+            if m.voice_controller.midi_note.is_some() {
+                let mut v = &mut synth_0_voices[m.voice_controller.voice_ix];
+                v.freq = pitch(m.voice_controller.midi_note.unwrap())
+                    + synth_0_settings.vib_amp
+                        * (timing.t_rel * TAU * synth_0_settings.vib_hz).sin();
+                v.phase = (v.phase + timing.dt_rel * v.freq) % 1.;
+                v.amp = f64::min(
+                    f64::min(
+                        lerp(
+                            0.,
+                            1.,
+                            (timing.beat - m.voice_controller.start_beat as f64)
+                                / DURATION_MULTIPLIER as f64
+                                / synth_0_settings.fade_in_t,
+                        ),
+                        lerp(
+                            0.,
+                            1.,
+                            (m.voice_controller.end_beat as f64 - timing.beat)
+                                / DURATION_MULTIPLIER as f64
+                                / synth_0_settings.fade_out_t,
+                        ),
+                    ),
+                    1.,
+                ) * wavetable_lerp_sample(&synth_0_settings.wavetable, v.phase);
             }
         }
 
         // sum amplitude
         let amp = synth_0_voices.iter().map(|v| v.amp).sum::<f64>() / synth_0_voices.len() as f64;
+        assert!(amp.abs() <= 1.);
 
         // progress time
         timing.step();
-        for m in melody_lines.iter_mut() {
-            m.voice_controller.step_time(timing.life_step);
-            synth_0_voices[m.voice_controller.voice_ix].step_time(
-                pitch(m.voice_controller.midi_note),
-                m.voice_controller.age,
-                m.voice_controller.lifetime,
-                timing.t_rel,
-                timing.dt_rel,
-                synth_0_settings.vib_hz,
-                synth_0_settings.vib_amp,
-                synth_0_settings.fade_in_t,
-                synth_0_settings.fade_out_t,
-                &synth_0_settings.wavetable,
-            );
-            m.beat_countdown -= timing.life_step as f64;
-        }
 
-        amp * 0.3 // (about equal to Spotify at full volume)
+        amp * 0.9
     };
 
-    event_loop.run(move |stream_id, stream_result| {
-        let stream_data = match stream_result {
-            Ok(data) => data,
-            Err(err) => {
-                eprintln!("an error occurred on stream {:?}: {}", stream_id, err);
-                return;
-            }
-        };
+    let music_thread = thread::Builder::new()
+        .name("music".to_string())
+        .spawn(move || {
+            event_loop.run(move |stream_id, stream_result| {
+                let stream_data = match stream_result {
+                    Ok(data) => data,
+                    Err(err) => {
+                        eprintln!("an error occurred on stream {:?}: {}", stream_id, err);
+                        return;
+                    }
+                };
 
-        match stream_data {
-            StreamData::Output {
-                buffer: UnknownTypeOutputBuffer::U16(mut buffer),
-            } => {
-                for sample in buffer.chunks_mut(format.channels as usize) {
-                    let value = ((next_value() * 0.5 + 0.5) * std::u16::MAX as f64) as u16;
-                    for out in sample.iter_mut() {
-                        *out = value;
+                match stream_data {
+                    StreamData::Output {
+                        buffer: UnknownTypeOutputBuffer::U16(mut buffer),
+                    } => {
+                        for sample in buffer.chunks_mut(format.channels as usize) {
+                            let value = ((next_value() * 0.5 + 0.5) * std::u16::MAX as f64) as u16;
+                            for out in sample.iter_mut() {
+                                *out = value;
+                            }
+                        }
+                    }
+                    StreamData::Output {
+                        buffer: UnknownTypeOutputBuffer::I16(mut buffer),
+                    } => {
+                        for sample in buffer.chunks_mut(format.channels as usize) {
+                            let value = (next_value() * std::i16::MAX as f64) as i16;
+                            for out in sample.iter_mut() {
+                                *out = value;
+                            }
+                        }
+                    }
+                    StreamData::Output {
+                        buffer: UnknownTypeOutputBuffer::F32(mut buffer),
+                    } => {
+                        for sample in buffer.chunks_mut(format.channels as usize) {
+                            let value = next_value() as f32;
+                            for out in sample.iter_mut() {
+                                *out = value;
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            });
+        })?;
+
+    // Terminal
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
+
+    let (input_tx, input_rx) = mpsc::channel();
+    let (input_kill_tx, input_kill_rx) = mpsc::channel();
+    let input_thread = thread::Builder::new()
+        .name("input".to_string())
+        .spawn(move || {
+            let tick_rate = Duration::from_millis(16);
+            let mut last_tick = Instant::now();
+            loop {
+                if event::poll(tick_rate - last_tick.elapsed()).unwrap() {
+                    if let CrosstermEvent::Key(key) = event::read().unwrap() {
+                        input_tx.send(InputEvent::Key(key)).unwrap();
                     }
                 }
-            }
-            StreamData::Output {
-                buffer: UnknownTypeOutputBuffer::I16(mut buffer),
-            } => {
-                for sample in buffer.chunks_mut(format.channels as usize) {
-                    let value = (next_value() * std::i16::MAX as f64) as i16;
-                    for out in sample.iter_mut() {
-                        *out = value;
+                if last_tick.elapsed() >= tick_rate {
+                    input_tx.send(InputEvent::Tick).unwrap();
+                    last_tick = Instant::now();
+                }
+                match input_kill_rx.try_recv() {
+                    Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                        break;
                     }
+                    _ => {}
                 }
             }
-            StreamData::Output {
-                buffer: UnknownTypeOutputBuffer::F32(mut buffer),
-            } => {
-                for sample in buffer.chunks_mut(format.channels as usize) {
-                    let value = next_value() as f32;
-                    for out in sample.iter_mut() {
-                        *out = value;
-                    }
+        })?;
+
+    terminal.clear()?;
+
+    loop {
+        terminal.draw(|mut f| {
+            let size = f.size();
+            let block = Block::default().title("Block").borders(Borders::ALL);
+            f.render_widget(block, size);
+        })?;
+        match input_rx.recv()? {
+            InputEvent::Key(event) => match event.code {
+                KeyCode::Char('q') => {
+                    disable_raw_mode()?;
+                    execute!(
+                        terminal.backend_mut(),
+                        LeaveAlternateScreen,
+                        DisableMouseCapture
+                    )?;
+                    terminal.show_cursor()?;
+                    break;
                 }
-            }
-            _ => (),
+                _ => {}
+            },
+            InputEvent::Tick => {} // rerender
         }
-    });
+    }
+
+    input_kill_tx.send(())?;
+    input_thread.join().expect("Input thread panicked");
+    drop(music_thread); // NOTE: waiting for cpal push to crates.io for more graceful handling
+
+    Ok(())
 }
