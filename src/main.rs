@@ -12,8 +12,10 @@ use std::{
 
 use tui::{
     backend::CrosstermBackend,
-    //layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders /*, Widget*/},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    symbols::DOT,
+    widgets::{Block, Borders, List, Tabs, Text},
     Terminal,
 };
 
@@ -29,6 +31,8 @@ use cpal::{
     traits::{DeviceTrait, EventLoopTrait, HostTrait},
     StreamData, UnknownTypeOutputBuffer,
 };
+
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
 use rand::{prelude::*, rngs::SmallRng};
 
@@ -170,6 +174,11 @@ pub fn wavetable_lerp_sample(wavetable: &[f64; WAVETABLE_SIZE], t: f64) -> f64 {
 enum InputEvent {
     Key(KeyEvent),
     Tick,
+}
+
+#[derive(Clone, Copy)]
+enum InputCommand {
+    Quit,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -429,14 +438,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         })?;
 
-    // Terminal
+    // UI
 
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.hide_cursor()?;
+    terminal.hide_cursor()?; // NOTE: works natively but not in vscode terminal
 
     let (input_tx, input_rx) = mpsc::channel();
     let (input_kill_tx, input_kill_rx) = mpsc::channel();
@@ -466,15 +475,110 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     terminal.clear()?;
 
+    let mut input_string = "".to_string();
+
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let cmds = vec![("quit", InputCommand::Quit)];
+
     loop {
+        let input_str = &input_string;
+        let mut matched: Option<(usize, i64)> = None;
+        for (i, cmd) in cmds.iter().enumerate() {
+            if let &Some(score) = &matcher.fuzzy_match(cmd.0, input_str) {
+                if score > 0 && (matched.is_none() || score > matched.unwrap().1) {
+                    matched = Some((i, score));
+                }
+            }
+        }
         terminal.draw(|mut f| {
-            let size = f.size();
-            let block = Block::default().title("Block").borders(Borders::ALL);
-            f.render_widget(block, size);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)].as_ref())
+                .split(f.size());
+            use tui::widgets::Paragraph;
+            f.render_widget(
+                Paragraph::new(
+                    [
+                        Text::styled("> ", Style::default().fg(Color::Cyan)),
+                        if input_str.len() == 0 {
+                            Text::styled("Type something...", Style::default().fg(Color::DarkGray))
+                        } else {
+                            Text::raw(input_str)
+                        },
+                        if let Some((matched_ix, _)) = matched {
+                            Text::styled(
+                                " (".to_string() + cmds[matched_ix].0 + ")",
+                                Style::default().fg(Color::LightBlue),
+                            )
+                        } else {
+                            Text::raw("")
+                        },
+                    ]
+                    .iter(),
+                ),
+                chunks[1],
+            );
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                .split(chunks[0]);
+            let mut list_state = tui::widgets::ListState::default();
+            list_state.select(Some(1));
+            f.render_stateful_widget(
+                List::new(["Item 1", "Item 2", "Item 3"].iter().map(|i| Text::raw(*i)))
+                    .block(
+                        Block::default()
+                            .title("List")
+                            .title_style(Style::default().fg(Color::Cyan))
+                            .borders(Borders::ALL),
+                    )
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().modifier(Modifier::ITALIC))
+                    .highlight_symbol(">>"),
+                chunks[0],
+                &mut list_state,
+            );
+            f.render_widget(
+                Tabs::default()
+                    .block(
+                        Block::default()
+                            .title("Tabs")
+                            .title_style(Style::default().fg(Color::Cyan))
+                            .borders(Borders::ALL),
+                    )
+                    .titles(&["Tab1", "Tab2", "Tab3", "Tab4"])
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().fg(Color::Yellow))
+                    .select(2)
+                    .divider(DOT),
+                chunks[1],
+            );
         })?;
+        let mut cmd = None;
         match input_rx.recv()? {
             InputEvent::Key(event) => match event.code {
-                KeyCode::Char('q') => {
+                KeyCode::Esc => {
+                    cmd = Some(InputCommand::Quit);
+                }
+                KeyCode::Enter => match matched {
+                    Some((matched_ix, _)) => {
+                        cmd = Some(cmds[matched_ix].1);
+                    }
+                    _ => {}
+                },
+                KeyCode::Backspace => {
+                    input_string.pop();
+                }
+                KeyCode::Char(c) => {
+                    input_string.push(c);
+                }
+                _ => {}
+            },
+            InputEvent::Tick => {} // rerender
+        }
+        if let Some(cmd) = cmd {
+            match cmd {
+                InputCommand::Quit => {
                     disable_raw_mode()?;
                     execute!(
                         terminal.backend_mut(),
@@ -484,15 +588,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     terminal.show_cursor()?;
                     break;
                 }
-                _ => {}
-            },
-            InputEvent::Tick => {} // rerender
+            }
         }
     }
 
     input_kill_tx.send(())?;
     input_thread.join().expect("Input thread panicked");
-    drop(music_thread); // NOTE: waiting for cpal push to crates.io for more graceful handling
+    drop(music_thread); // NOTE: waiting for cpal crate push before handling more gracefully
 
     Ok(())
 }
