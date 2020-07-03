@@ -8,11 +8,11 @@ edition = "2018"
 
 [lib]
 name = "muth"
-path = "src/lib.rs"
+path = "src/lib/mod.rs"
 
 [[bin]]
 name = "muthgen"
-path = "src/main.rs"
+path = "src/main/mod.rs"
 
 [dependencies]
 cpal = "0.11.0"
