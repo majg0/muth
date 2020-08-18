@@ -1,11 +1,12 @@
-use std::{error::Error, sync::mpsc, thread};
+use std::error::Error;
+use std::sync::mpsc;
+use std::thread;
 
-use cpal::{
-    traits::{DeviceTrait, EventLoopTrait, HostTrait},
-    StreamData, UnknownTypeOutputBuffer,
-};
+use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
+use cpal::{StreamData, UnknownTypeOutputBuffer};
 
-use muth::{BeatTime, MIDI_NOTE_COUNT, Note, BeatDuration, DURATION_MULTIPLIER};
+use muth::note_constants::MIDI_NOTE_COUNT;
+use muth::{BeatDuration, BeatTime, Note, DURATION_MULTIPLIER};
 
 pub const OK_AUDIO_DELAY_MILLISECONDS: u64 = 5;
 
